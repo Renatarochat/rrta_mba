@@ -16,7 +16,7 @@ DEFAULT_ARGS = {
 
 
 @task
-def fetch_bitcoin_history_from_coingecko():
+def fetch_bitcoin_history_from_coingecko1():
     """
     Coleta dados horários do Bitcoin na janela "ontem"
     usando CoinGecko /coins/bitcoin/market_chart/range.
@@ -105,9 +105,9 @@ def fetch_bitcoin_history_from_coingecko():
     },
     tags=["bitcoin", "etl", "coingecko"],
 )
-def bitcoin_etl_coingecko():
-    fetch_bitcoin_history_from_coingecko()
+def bitcoin_etl_coingecko1():
+    fetch_bitcoin_history_from_coingecko1()
 
 
 # Airflow descobre qualquer variável global que referencie um DAG
-dag = bitcoin_etl_coingecko()
+dag = bitcoin_etl_coingecko1()
