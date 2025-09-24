@@ -85,6 +85,7 @@ def fetch_bitcoin_history_from_coingecko1():
     schedule="0 0 * * *",  # diário à 00:00 UTC
     start_date=pendulum.datetime(2025, 9, 2, tz="UTC"),
     catchup=True,
+    max_active_runs=1,       # <-- only one DagRun at a time
     owner_links={
         "Alex Lopes": "mailto:alexlopespereira@gmail.com",
         "Open in Cloud IDE": "https://cloud.astronomer.io/cm3webulw15k701npm2uhu77t/cloud-ide/cm42rbvn10lqk01nlco70l0b8/cm44gkosq0tof01mxajutk86g",
