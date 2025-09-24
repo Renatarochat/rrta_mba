@@ -73,25 +73,11 @@ def fetch_bitcoin_history_from_coingecko1():
     print("Prévia horária (top 10):")
     print(df.head(10).to_string())
 
-    # ---- AGREGADO DIÁRIO (apenas 1 linha por dia) ----
-    daily = (
-        df.resample("1D")
-          .agg(
-              price_usd=("price_usd", "last"),
-              market_cap_usd=("market_cap_usd", "last"),
-              volume_usd=("volume_usd", "sum"),
-          )
-          .dropna(how="all")
-    )
-
-    print("Agregado diário a salvar:")
-    print(daily.to_string())
-
-    # Salvar somente o agregado diário
+   
     from airflow.providers.postgres.hooks.postgres import PostgresHook
     hook = PostgresHook(postgres_conn_id="postgres")
     engine = hook.get_sqlalchemy_engine()
-    daily.to_sql("bitcoin_history_renata_rrta", con=engine, if_exists="append", index=True)
+    df.to_sql("bitcoin_history_renata_rrta", con=engine, if_exists="append", index=True)
 
 
 @dag(
