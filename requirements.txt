@@ -1,3 +1,4 @@
 astro-sdk-python[google]==1.5.3
 PyYAML>=6.0.1
-apache-airflow-providers-google
+apache-airflow==2.9.2
+apache-airflow-providers-google==10.21.0
