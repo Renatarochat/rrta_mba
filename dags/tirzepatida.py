@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from typing import Any, Dict, List
 
 # ========================= Config =========================
-GCP_PROJECT    = "365846072239"
+GCP_PROJECT = "bigquery-sandbox-471123"
 BQ_DATASET     = "dataset_fda"
 BQ_TABLE_STAGE = "tirzepatide_events_stage"   # 3º passo (salva flat)
 BQ_TABLE_COUNT = "openfda_tirzepatida"        # 4º passo (agrega diário)
