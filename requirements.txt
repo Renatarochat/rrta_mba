@@ -1,1 +1,10 @@
 astro-sdk-python[amazon,databricks,duckdb,google,postgres,snowflake]==1.5.3
+
+# Providers e libs extras necessários p/ sua DAG
+apache-airflow-providers-google
+google-cloud-bigquery
+pandas
+pandas-gbq
+pyarrow
+requests
+pendulum
