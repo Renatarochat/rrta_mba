@@ -22,7 +22,7 @@ GCP_CONN_ID    = "google_cloud_default"
 # Janela: exemplo de jan–jun/2025
 TEST_START = date(2025, 1, 1)
 TEST_END   = date(2025, 6, 30)
-DRUG_QUERY = "tirzepatide"   # 🔹 mudou aqui
+DRUG_QUERY = "tirzepatide"
 
 API_LIMIT   = 1000
 TIMEOUT_S   = 30
@@ -35,7 +35,6 @@ SESSION.headers.update({"User-Agent": "didactic-openfda-etl/1.0 (contato: exempl
 # ========================= Helpers =========================
 def _search_expr(day: date, drug_query: str) -> str:
     d = day.strftime("%Y%m%d")
-    # 🔹 consulta dia a dia (forma mais estável)
     return f'patient.drug.openfda.generic_name:"{drug_query}" AND receivedate:{d}'
 
 def _openfda_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
@@ -47,7 +46,7 @@ def _openfda_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
         if 200 <= r.status_code < 300:
             return r.json()
         if attempt < MAX_RETRIES and r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(attempt)
+            time.sleep(attempt)  # backoff simples
             continue
         r.raise_for_status()
 
@@ -79,7 +78,7 @@ def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 # ========================= DAG =========================
 @dag(
-    dag_id="openfda_tirzepatida_stage_pipeline",   # 🔹 mudou
+    dag_id="openfda_tirzepatida_stage_pipeline",
     description="Consulta openFDA (tirzepatide) -> trata (flat) -> salva (BQ stage) -> agrega diário (BQ).",
     schedule="@once",
     start_date=pendulum.datetime(2025, 9, 27, tz="UTC"),
@@ -89,13 +88,33 @@ def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 )
 def openfda_tirzepatida_stage_pipeline():
 
-    @task
-    def fetch_raw() -> List[Dict[str, Any]]:
+    # grava direto no BQ em append; não retorna dados (evita XCom gigante)
+    @task(do_xcom_push=False, queue="heavy", retries=2)
+    def stage_from_openfda() -> Dict[str, str]:
         base_url = "https://api.fda.gov/drug/event.json"
-        all_rows: List[Dict[str, Any]] = []
+
+        # esquema fixo p/ garantir tipos no BQ
+        schema = [
+            {"name": "safetyreportid",       "type": "STRING"},
+            {"name": "receivedate",          "type": "DATE"},
+            {"name": "patientsex",           "type": "INTEGER"},
+            {"name": "primarysourcecountry", "type": "STRING"},
+            {"name": "serious",              "type": "INTEGER"},
+            {"name": "reaction_pt",          "type": "STRING"},
+            {"name": "drug_product",         "type": "STRING"},
+        ]
+
+        bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
+        creds = bq.get_credentials()
+
+        first_write = True
+        total = 0
         day = TEST_START
+
         while day <= TEST_END:
             skip = 0
+            wrote_day = 0
+
             while True:
                 params = {
                     "search": _search_expr(day, DRUG_QUERY),
@@ -107,55 +126,40 @@ def openfda_tirzepatida_stage_pipeline():
                 rows = payload.get("results", []) or []
                 if not rows:
                     break
-                all_rows.extend(rows)
+
+                # normaliza só o lote atual (economia de RAM)
+                df = _to_flat(rows)
+                if not df.empty:
+                    pandas_gbq.to_gbq(
+                        df,
+                        destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
+                        project_id=GCP_PROJECT,
+                        if_exists=("replace" if first_write else "append"),
+                        credentials=creds,
+                        table_schema=schema,
+                        location=BQ_LOCATION,
+                        progress_bar=False,
+                        chunksize=10_000,  # grava em lotes no BQ
+                    )
+                    first_write = False
+                    wrote_day += len(df)
+                    total += len(df)
+
+                # próximo lote no mesmo dia
                 skip += API_LIMIT
                 if len(rows) < API_LIMIT:
                     break
+
+            print(f"[stage] {day}: {wrote_day} linhas (acumulado {total}).")
             day += timedelta(days=1)
 
-        print(f"[fetch] {TEST_START}–{TEST_END}: {len(all_rows)} registros no total.")
-        return all_rows
-
-    @task
-    def normalize_minimal(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        df = _to_flat(rows)
-        print(f"[normalize] Linhas pós-normalização: {len(df)}")
-        if not df.empty:
-            print("[normalize] Preview:\n", df.head(10).to_string(index=False))
-        return df.to_dict(orient="records")
-
-    @task
-    def load_stage(rows_flat: List[Dict[str, Any]]) -> Dict[str, str]:
-        if not rows_flat:
-            print("[stage] Nada a gravar.")
-            return {"inserted": "0"}
-
-        df = pd.DataFrame(rows_flat)
-        schema = [
-            {"name": "safetyreportid",       "type": "STRING"},
-            {"name": "receivedate",          "type": "DATE"},
-            {"name": "patientsex",           "type": "INTEGER"},
-            {"name": "primarysourcecountry", "type": "STRING"},
-            {"name": "serious",              "type": "INTEGER"},
-            {"name": "reaction_pt",          "type": "STRING"},
-            {"name": "drug_product",         "type": "STRING"},
-        ]
-        bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
-        creds = bq.get_credentials()
-        df.to_gbq(
-            destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
-            project_id=GCP_PROJECT,
-            if_exists="replace",
-            credentials=creds,
-            table_schema=schema,
-            location=BQ_LOCATION,
-            progress_bar=False,
-        )
+        print(f"[stage] Janela {TEST_START}–{TEST_END}: {total} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}.")
+        # retorna só metadados pequenos (XCom pequeno)
         return {"start": TEST_START.strftime("%Y-%m-%d"),
                 "end":   TEST_END.strftime("%Y-%m-%d"),
                 "drug":  DRUG_QUERY}
 
-    @task
+    @task(retries=2)
     def build_daily_counts(meta: Dict[str, str]) -> None:
         start, end, drug = meta["start"], meta["end"], meta["drug"]
 
@@ -171,6 +175,7 @@ def openfda_tirzepatida_stage_pipeline():
         """
         bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
         creds = bq.get_credentials()
+
         df_counts = pandas_gbq.read_gbq(
             sql,
             project_id=GCP_PROJECT,
@@ -188,7 +193,8 @@ def openfda_tirzepatida_stage_pipeline():
             {"name": "events", "type": "INTEGER"},
             {"name": "drug",   "type": "STRING"},
         ]
-        df_counts.to_gbq(
+        pandas_gbq.to_gbq(
+            df_counts,
             destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
             project_id=GCP_PROJECT,
             if_exists="replace",
@@ -196,9 +202,10 @@ def openfda_tirzepatida_stage_pipeline():
             table_schema=schema_counts,
             location=BQ_LOCATION,
             progress_bar=False,
+            chunksize=10_000,
         )
         print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
 
-    build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
+    build_daily_counts(stage_from_openfda())
 
 openfda_tirzepatida_stage_pipeline()
