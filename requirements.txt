@@ -1,4 +1,6 @@
-astro-sdk-python[amazon,databricks,duckdb,google,postgres,snowflake]==1.5.3
+# só o que você precisa para a DAG
+astro-sdk-python[google,postgres]==1.5.3
+
 
 # Providers e libs extras necessários p/ sua DAG
 apache-airflow-providers-google
