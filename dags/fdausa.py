@@ -13,12 +13,12 @@ from google.cloud import bigquery
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 
-DAG_ID = "openfda_semaglutide_monthly_to_bq"
+DAG_ID = "openfda_atorvastatin_monthly_to_bq"
 ALLOW_EMPTY = False  # mude para True se preferir não falhar quando não houver dados
 
 
 def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
-    """GET tolerante: 404 -> None; 429/5xx -> alguns retries; demais -> raise."""
+    """GET tolerante: 404 -> None; 429/5xx -> retries exponenciais leves; demais -> raise."""
     headers = {"User-Agent": f"airflow-dag/{DAG_ID}"}
     for attempt in range(3):
         resp = requests.get(endpoint, params=params, headers=headers, timeout=timeout)
@@ -44,14 +44,14 @@ def _month_bounds(exec_end: datetime) -> tuple[date, date]:
 
 @dag(
     dag_id=DAG_ID,
-    description="Coletar eventos OpenFDA de semaglutida por 1 mês e salvar no BigQuery para série histórica",
+    description="Coletar eventos OpenFDA de atorvastatina (Lipitor) por 1 mês e salvar no BigQuery para série histórica",
     start_date=datetime(2025, 8, 1),
     schedule="@monthly",
     catchup=False,
     default_args={"owner": "data-eng"},
-    tags=["openfda", "semaglutide", "bigquery"],
+    tags=["openfda", "atorvastatin", "lipitor", "bigquery"],
 )
-def semaglutide_openfda_monthly_to_bq():
+def atorvastatin_openfda_monthly_to_bq():
     @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> List[Dict[str, Any]]:
         """
@@ -68,13 +68,13 @@ def semaglutide_openfda_monthly_to_bq():
 
         endpoint = "https://api.fda.gov/drug/event.json"
 
-        # Semaglutida (substance, generic e marcas principais)
+        # Filtro para Atorvastatina (genérico, substância e marca)
         product_filter = (
             '('
-            'patient.drug.openfda.substance_name.exact:("SEMAGLUTIDE") OR '
-            'patient.drug.openfda.generic_name.exact:("SEMAGLUTIDE") OR '
-            'patient.drug.openfda.brand_name.exact:("OZEMPIC" OR "WEGOVY" OR "RYBELSUS") OR '
-            'patient.drug.medicinalproduct:("semaglutide" OR "Ozempic" OR "Wegovy" OR "Rybelsus")'
+            'patient.drug.openfda.substance_name.exact:("ATORVASTATIN CALCIUM" OR "ATORVASTATIN") OR '
+            'patient.drug.openfda.generic_name.exact:("ATORVASTATIN") OR '
+            'patient.drug.openfda.brand_name.exact:("LIPITOR") OR '
+            'patient.drug.medicinalproduct:("atorvastatin" OR "Lipitor")'
             ')'
         )
         rcv_range = f"receivedate:[{start_ds} TO {end_ds}]"
@@ -94,7 +94,8 @@ def semaglutide_openfda_monthly_to_bq():
             logging.info("OpenFDA count(receiptdate) => %d linhas.", len(data2["results"]))
             return data2["results"]
 
-        # (3) Paginação de eventos e agregação local (usa OR de datas)
+        # (3) Paginação de eventos e agregação local (usa OR de datas).
+        # Evitamos 'fields' e 'sort' para reduzir risco de 400.
         limit = 100
         skip = 0
         counts: Dict[str, int] = {}
@@ -129,6 +130,11 @@ def semaglutide_openfda_monthly_to_bq():
 
     @task(task_id="transform_events")
     def transform_events(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normaliza para schema:
+        - receivedate (DATE, YYYY-MM-DD)
+        - count (INT64)
+        """
         out: List[Dict[str, Any]] = []
         for row in results or []:
             received = row.get("receivedate", row.get("time"))
@@ -166,7 +172,7 @@ def semaglutide_openfda_monthly_to_bq():
 
         project_id = "bigquery-sandbox-471123"
         dataset_id = "dataset_fda"
-        table_id = "drug_events_semaglutide_daily"  # nova tabela para semaglutida
+        table_id = "drug_events_atorvastatin_daily"
         gcp_conn_id = "google_cloud_default"
 
         bq_hook = BigQueryHook(gcp_conn_id=gcp_conn_id, use_legacy_sql=False)
@@ -177,7 +183,7 @@ def semaglutide_openfda_monthly_to_bq():
             client.get_dataset(dataset_ref)
         except Exception:
             ds = bigquery.Dataset(dataset_ref)
-            ds.location = "US"
+            ds.location = "US"  # ajuste se seu projeto usar outra região
             client.create_dataset(ds, exists_ok=True)
 
         table_ref = dataset_ref.table(table_id)
@@ -217,4 +223,4 @@ def semaglutide_openfda_monthly_to_bq():
     save_to_bigquery(transformed)
 
 
-dag = semaglutide_openfda_monthly_to_bq()
+dag = atorvastatin_openfda_monthly_to_bq()
