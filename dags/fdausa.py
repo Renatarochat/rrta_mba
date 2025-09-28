@@ -14,10 +14,11 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 
 DAG_ID = "openfda_tirzepatide_monthly_to_bq"
+ALLOW_EMPTY = False  # coloque True se quiser que o DAG “verde” mesmo sem dados
 
 
 def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
-    """GET com pequenas tolerâncias: 404 -> None; 429/5xx com retry simples."""
+    """GET com tolerância: 404 -> None; 429/5xx com retries simples."""
     headers = {"User-Agent": f"airflow-dag/{DAG_ID}"}
     for attempt in range(3):
         resp = requests.get(endpoint, params=params, headers=headers, timeout=timeout)
@@ -35,7 +36,7 @@ def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Op
 
 
 def _month_bounds(exec_end: datetime) -> tuple[date, date]:
-    """Retorna (primeiro_dia, ultimo_dia) do mês referente ao data_interval_end - 1 dia."""
+    """(primeiro_dia, ultimo_dia) do mês de (data_interval_end - 1 dia)."""
     last_day = (exec_end - timedelta(days=1)).date()
     first_day = last_day.replace(day=1)
     return first_day, last_day
@@ -54,53 +55,66 @@ def tirzepatide_openfda_monthly_to_bq():
     @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> List[Dict[str, Any]]:
         """
-        Tenta a agregação nativa (count=receivedate).
-        Se vier vazia/404, faz fallback por dia (até 31 chamadas) somando counts.
+        1) Tenta agregação nativa (count=receivedate).
+        2) Se vazio, pagina eventos e agrega localmente por receivedate (fallback para receiptdate).
+        Retorno sempre no formato [{"time": "YYYYMMDD", "count": N}, ...].
         """
         ctx = get_current_context()
         first_day, last_day = _month_bounds(ctx["data_interval_end"])
-
         start_ds = first_day.strftime("%Y%m%d")
         end_ds = last_day.strftime("%Y%m%d")
 
         endpoint = "https://api.fda.gov/drug/event.json"
 
-        # Filtro por produto (robusto, mas simples o suficiente para evitar 400s).
+        # Filtro simples e compatível (evita 400): medicinalproduct + marcas + substância
         product_filter = (
             '('
             'patient.drug.medicinalproduct:("tirzepatide" OR "Mounjaro" OR "Zepbound") '
-            'OR patient.drug.openfda.substance_name.exact:("TIRZEPATIDE") '
-            'OR patient.drug.openfda.brand_name.exact:("MOUNJARO" OR "ZEPBOUND")'
+            'OR patient.drug.openfda.brand_name.exact:("MOUNJARO" OR "ZEPBOUND") '
+            'OR patient.drug.openfda.substance_name.exact:("TIRZEPATIDE")'
             ')'
         )
         date_range = f"receivedate:[{start_ds} TO {end_ds}]"
         base_search = f"{product_filter} AND {date_range}"
 
-        # 1) Agregação nativa
+        # (1) Agregação nativa
         params_count = {"search": base_search, "count": "receivedate", "limit": 1000}
         data = _openfda_get(endpoint, params_count, timeout=60)
         if data and isinstance(data.get("results"), list) and data["results"]:
-            logging.info("OpenFDA count retornou %d linhas.", len(data["results"]))
+            logging.info("OpenFDA (count=receivedate) retornou %d linhas.", len(data["results"]))
             return data["results"]
 
-        # 2) Fallback: por dia (count por dia específico)
-        out: List[Dict[str, Any]] = []
-        cur = first_day
-        while cur <= last_day:
-            d = cur.strftime("%Y%m%d")
-            search = f"{product_filter} AND receivedate:{d}"
-            params_daily = {"search": search, "count": "receivedate", "limit": 1}
-            daily = _openfda_get(endpoint, params_daily, timeout=30)
-            results = (daily or {}).get("results", [])
-            if isinstance(results, list) and results:
-                # A API retorna [{"time":"YYYYMMDD", "count": N}]
-                item = results[0]
-                # Garante que a data é exatamente o dia consultado
-                if str(item.get("time")) == d and int(item.get("count", 0)) > 0:
-                    out.append({"time": d, "count": int(item["count"])})
-            cur += timedelta(days=1)
+        # (2) Paginação de eventos e agregação local
+        limit = 100
+        skip = 0
+        counts: Dict[str, int] = {}
+        total = 0
 
-        logging.info("Fallback diário produziu %d linhas.", len(out))
+        while True:
+            params_page = {
+                "search": base_search,  # sem fields/sort para evitar 400
+                "limit": limit,
+                "skip": skip,
+            }
+            page = _openfda_get(endpoint, params_page, timeout=60)
+            results = (page or {}).get("results", [])
+            if not results:
+                break
+
+            for ev in results:
+                # Preferimos 'receivedate'; se ausente, caímos para 'receiptdate'
+                rd = ev.get("receivedate") or ev.get("receiptdate")
+                if rd:
+                    key = str(rd)
+                    counts[key] = counts.get(key, 0) + 1
+                    total += 1
+
+            if len(results) < limit:
+                break
+            skip += limit
+
+        out = [{"time": k, "count": v} for k, v in sorted(counts.items())]
+        logging.info("Fallback agregou %d eventos em %d dias distintos.", total, len(out))
         return out
 
     @task(task_id="transform_events")
@@ -128,14 +142,17 @@ def tirzepatide_openfda_monthly_to_bq():
 
             out.append({"receivedate": dt.isoformat(), "count": c})
 
-        logging.info("Transform gerou %d linhas.", len(out))
+        logging.info("Transform produziu %d linhas.", len(out))
         return out
 
     @task(task_id="save_to_bigquery")
     def save_to_bigquery(rows: List[Dict[str, Any]]) -> None:
         if not rows:
-            logging.info("Nenhum dado para carregar no BigQuery.")
-            return
+            msg = "Nenhum dado para carregar no BigQuery (consulta OpenFDA retornou 0)."
+            if ALLOW_EMPTY:
+                logging.info(msg)
+                return
+            raise RuntimeError(msg)
 
         project_id = "bigquery-sandbox-471123"
         dataset_id = "dataset_fda"
@@ -158,7 +175,9 @@ def tirzepatide_openfda_monthly_to_bq():
             bigquery.SchemaField("receivedate", "DATE", mode="REQUIRED"),
             bigquery.SchemaField("count", "INT64", mode="REQUIRED"),
         ]
-        time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="receivedate")
+        time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="receivedate"
+        )
 
         try:
             client.get_table(table_ref)
