@@ -15,7 +15,7 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 DAG_ID = "openfda_atorvastatin_monthly_to_bq_diagnostic"
 OPENFDA_ENDPOINT = "https://api.fda.gov/drug/event.json"
-ALLOW_EMPTY = True  # mantemos True para SEMPRE escrever o probe e a amostra
+ALLOW_EMPTY = True  # mantém True para sempre salvar probe/amostra mesmo sem série
 
 
 # --------------------------- Helpers ---------------------------
@@ -40,10 +40,7 @@ def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Op
 
 def _month_bounds_from_year_month(y: int, m: int) -> Tuple[date, date]:
     first = date(y, m, 1)
-    if m == 12:
-        next_first = date(y + 1, 1, 1)
-    else:
-        next_first = date(y, m + 1, 1)
+    next_first = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
     last = next_first - timedelta(days=1)
     return first, last
 
@@ -63,11 +60,13 @@ def _resolve_window(ctx: Dict[str, Any]) -> Tuple[date, date]:
     except Exception:
         conf = {}
 
-    y = conf.get("year"); m = conf.get("month")
+    y = conf.get("year")
+    m = conf.get("month")
     if isinstance(y, int) and isinstance(m, int) and 1 <= m <= 12:
         return _month_bounds_from_year_month(y, m)
 
-    start = conf.get("start"); end = conf.get("end")
+    start = conf.get("start")
+    end = conf.get("end")
     if isinstance(start, str) and isinstance(end, str) and len(start) == 8 and len(end) == 8:
         try:
             first = datetime.strptime(start, "%Y%m%d").date()
@@ -91,7 +90,7 @@ def _ds(d: date) -> str:
 
 @dag(
     dag_id=DAG_ID,
-    description="Série histórica diária de eventos FAERS para Atorvastatina (Lipitor) com artefatos de diagnóstico",
+    description="Série diária de eventos FAERS para Atorvastatina (Lipitor) com artefatos de diagnóstico",
     start_date=datetime(2023, 1, 1),
     schedule="@monthly",
     catchup=True,
@@ -99,15 +98,15 @@ def _ds(d: date) -> str:
     tags=["openfda", "atorvastatin", "lipitor", "bigquery", "diagnostic"],
 )
 def atorvastatin_openfda_monthly_to_bq_diagnostic():
-    @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5)))
+    @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> Dict[str, Any]:
         """
         Retorna:
         {
-          "counts": [{"time":"YYYYMMDD","count":N}, ...],   # pode ser []
+          "counts": [{"time":"YYYYMMDD","count":N}, ...],
           "probe": { "has_data": bool, "received_pts": int, "receipt_pts": int,
                      "window_start":"YYYYMMDD","window_end":"YYYYMMDD" },
-          "sample": [ {..evento cru..}, ... ]               # até 200 eventos p/ inspeção
+          "sample": [ {..evento cru..}, ... ]   # até 200 eventos
         }
         """
         ctx = get_current_context()
@@ -115,7 +114,7 @@ def atorvastatin_openfda_monthly_to_bq_diagnostic():
         start_ds, end_ds = _ds(first_day), _ds(last_day)
         logging.info("Janela consultada: %s..%s", start_ds, end_ds)
 
-        # Filtro AMplo (sem .exact) → maior recall
+        # Filtro amplo (sem .exact) p/ maior recall
         product_filter = (
             '('
             'patient.drug.medicinalproduct:(atorvastatin OR lipitor) OR '
@@ -126,26 +125,25 @@ def atorvastatin_openfda_monthly_to_bq_diagnostic():
         rcv_range = f"receivedate:[{start_ds} TO {end_ds}]"
         rcp_range = f"receiptdate:[{start_ds} TO {end_ds}]"
 
-        # ===== A) count por receivedate
+        # A) count por receivedate
         params_a = {"search": f"{product_filter} AND {rcv_range}", "count": "receivedate", "limit": 1000}
         data_a = _openfda_get(OPENFDA_ENDPOINT, params_a, timeout=60)
         if data_a and isinstance(data_a.get("results"), list) and data_a["results"]:
             counts = data_a["results"]
         else:
-            # ===== B) count por receiptdate
+            # B) count por receiptdate
             params_b = {"search": f"{product_filter} AND {rcp_range}", "count": "receiptdate", "limit": 1000}
             data_b = _openfda_get(OPENFDA_ENDPOINT, params_b, timeout=60)
             counts = data_b["results"] if data_b and isinstance(data_b.get("results"), list) else []
 
-        # ===== C) PROBE (sem filtro de produto)
+        # C) PROBE sem filtro de produto
         probe_recv = _openfda_get(OPENFDA_ENDPOINT, {"search": rcv_range, "count": "receivedate"}, timeout=45)
         recv_pts = len((probe_recv or {}).get("results", []) or [])
         probe_rcpt = _openfda_get(OPENFDA_ENDPOINT, {"search": rcp_range, "count": "receiptdate"}, timeout=45)
         rcpt_pts = len((probe_rcpt or {}).get("results", []) or [])
         has_data = (recv_pts + rcpt_pts) > 0
 
-        # ===== D) Amostra bruta (para inspeção no BQ)
-        # Pegamos até 200 eventos com filtro de produto + (receivedate OR receiptdate)
+        # D) Amostra crua (até 200 eventos)
         sample_limit_total = 200
         per_page = 100
         collected = 0
@@ -325,7 +323,7 @@ def atorvastatin_openfda_monthly_to_bq_diagnostic():
 
     @task(task_id="save_sample_bq")
     def save_sample_bq(payload: Dict[str, Any]) -> None:
-        """Salva até 200 eventos crus para inspeção do filtro (útil para ajustar a consulta)."""
+        """Salva até 200 eventos crus para inspeção do filtro."""
         sample = payload.get("sample") or []
         if not sample:
             logging.info("Nenhuma amostra para salvar.")
@@ -348,9 +346,9 @@ def atorvastatin_openfda_monthly_to_bq_diagnostic():
             client.create_dataset(ds, exists_ok=True)
 
         table_ref = ds_ref.table(table_id)
-        # Esquema flexível: guardamos o JSON completo em uma coluna
+        # Usamos STRING para máxima compatibilidade de sandbox
         schema = [
-            bigquery.SchemaField("raw_event", "JSON", mode="REQUIRED"),
+            bigquery.SchemaField("raw_event", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("receivedate", "STRING", mode="NULLABLE"),
             bigquery.SchemaField("receiptdate", "STRING", mode="NULLABLE"),
             bigquery.SchemaField("ingested_at", "TIMESTAMP", mode="REQUIRED"),
@@ -369,7 +367,7 @@ def atorvastatin_openfda_monthly_to_bq_diagnostic():
         for ev in sample:
             buf.write((
                 json.dumps({
-                    "raw_event": ev,
+                    "raw_event": json.dumps(ev, ensure_ascii=False),
                     "receivedate": ev.get("receivedate"),
                     "receiptdate": ev.get("receiptdate"),
                     "ingested_at": now,
