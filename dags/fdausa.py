@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from collections import Counter
@@ -15,9 +16,7 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 DAG_ID = "openfda_tirzepatide_monthly_to_bq"
 
 
-def _openfda_get(
-    endpoint: str, params: Dict[str, Any], timeout: int = 60
-) -> Optional[Dict[str, Any]]:
+def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
     """Wrapper para GET da OpenFDA: trata 404 como vazio e valida JSON."""
     headers = {"User-Agent": f"airflow-dag/{DAG_ID}"}
     resp = requests.get(endpoint, params=params, headers=headers, timeout=timeout)
@@ -40,11 +39,11 @@ def _openfda_get(
     tags=["openfda", "tirzepatide", "bigquery"],
 )
 def tirzepatide_openfda_monthly_to_bq():
-    @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5)))
+    @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> List[Dict[str, Any]]:
         """
         Busca agregada diária (count=receivedate). Se vier vazio, faz fallback
-        paginando eventos e agregando localmente.
+        paginando eventos e agregando localmente (considera receivedate/receiptdate).
         """
         ctx = get_current_context()
         data_interval_end: datetime = ctx["data_interval_end"]
@@ -57,12 +56,12 @@ def tirzepatide_openfda_monthly_to_bq():
         end_ds = last_day.strftime("%Y%m%d")
 
         if start_ds > end_ds:
+            logging.info("Intervalo invertido %s > %s; retornando vazio.", start_ds, end_ds)
             return []
 
         endpoint = "https://api.fda.gov/drug/event.json"
 
-        # Filtro robusto: combina medicinalproduct, brand_name e substance_name,
-        # usando .exact onde apropriado para reduzir tokenização.
+        # Filtro robusto: combina medicinalproduct, brand_name e substance_name
         product_filter = (
             '('
             'patient.drug.medicinalproduct:("tirzepatide" OR "Mounjaro" OR "Zepbound") OR '
@@ -71,34 +70,28 @@ def tirzepatide_openfda_monthly_to_bq():
             'patient.drug.openfda.substance_name.exact:("TIRZEPATIDE")'
             ')'
         )
-
         date_filter = f"receivedate:[{start_ds} TO {end_ds}]"
         base_search = f"{product_filter} AND {date_filter}"
 
         # 1) Tentativa com agregação nativa
-        params_count = {
-            "search": base_search,
-            "count": "receivedate",
-            "limit": 1000,
-        }
+        params_count = {"search": base_search, "count": "receivedate", "limit": 1000}
         data = _openfda_get(endpoint, params_count, timeout=60)
         if data and isinstance(data.get("results"), list) and data["results"]:
-            # Resultados vêm como [{"time":"YYYYMMDD","count":N}, ...]
+            logging.info("OpenFDA (count=receivedate) retornou %d pontos.", len(data["results"]))
             return data["results"]
 
-        # 2) Fallback: paginação de eventos e agregação local por receivedate
-        # Usamos somente o campo receivedate para minimizar payload.
+        # 2) Fallback: paginação de eventos e agregação local por receivedate/receiptdate
         rows_per_page = 100
         skip = 0
         counts = Counter()
 
         while True:
             params_page = {
-                "search": base_search + " AND _exists_:receivedate",
+                "search": base_search + " AND (_exists_:receivedate OR _exists_:receiptdate)",
                 "limit": rows_per_page,
                 "skip": skip,
                 "sort": "receivedate:asc",
-                "fields": "receivedate",
+                "fields": "receivedate,receiptdate",
             }
             page = _openfda_get(endpoint, params_page, timeout=60)
             results = (page or {}).get("results", [])
@@ -106,7 +99,7 @@ def tirzepatide_openfda_monthly_to_bq():
                 break
 
             for r in results:
-                rd = r.get("receivedate")
+                rd = r.get("receivedate") or r.get("receiptdate")
                 if rd:
                     counts[str(rd)] += 1
 
@@ -114,8 +107,8 @@ def tirzepatide_openfda_monthly_to_bq():
                 break
             skip += rows_per_page
 
-        # Converte o Counter para o formato esperado de saída
         out = [{"time": k, "count": v} for k, v in sorted(counts.items())]
+        logging.info("Fallback agregou %d dias.", len(out))
         return out
 
     @task(task_id="transform_events")
@@ -148,11 +141,14 @@ def tirzepatide_openfda_monthly_to_bq():
                 continue
 
             out.append({"receivedate": dt.isoformat(), "count": c})
+
+        logging.info("Transform produziu %d linhas.", len(out))
         return out
 
     @task(task_id="save_to_bigquery")
     def save_to_bigquery(rows: List[Dict[str, Any]]) -> None:
         if not rows:
+            logging.info("Nenhum dado para carregar no BigQuery.")
             return
 
         project_id = "bigquery-sandbox-471123"
@@ -168,7 +164,6 @@ def tirzepatide_openfda_monthly_to_bq():
         try:
             client.get_dataset(dataset_ref)
         except Exception:
-            # Location padrão do sandbox é US; ajuste se necessário.
             ds = bigquery.Dataset(dataset_ref)
             ds.location = "US"
             client.create_dataset(ds, exists_ok=True)
@@ -180,8 +175,7 @@ def tirzepatide_openfda_monthly_to_bq():
             bigquery.SchemaField("count", "INT64", mode="REQUIRED"),
         ]
         time_partitioning = bigquery.TimePartitioning(
-            type_=bigquery.TimePartitioningType.DAY,
-            field="receivedate",
+            type_=bigquery.TimePartitioningType.DAY, field="receivedate"
         )
 
         try:
@@ -207,6 +201,7 @@ def tirzepatide_openfda_monthly_to_bq():
 
         job = client.load_table_from_file(buf, table_ref, job_config=job_config)
         job.result()
+        logging.info("Carregadas %d linhas no BigQuery.", len(rows))
 
     fetched = fetch_openfda()
     transformed = transform_events(fetched)
