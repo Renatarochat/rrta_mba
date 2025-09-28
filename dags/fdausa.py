@@ -13,7 +13,7 @@ from google.cloud import bigquery
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 
-DAG_ID = "openfda_tirzepatide_monthly_to_bq"
+DAG_ID = "openfda_semaglutide_monthly_to_bq"
 ALLOW_EMPTY = False  # mude para True se preferir não falhar quando não houver dados
 
 
@@ -36,7 +36,7 @@ def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Op
 
 
 def _month_bounds(exec_end: datetime) -> tuple[date, date]:
-    """Devolve (primeiro_dia, ultimo_dia) do mês de (data_interval_end - 1 dia)."""
+    """(primeiro_dia, ultimo_dia) do mês de (data_interval_end - 1 dia)."""
     last_day = (exec_end - timedelta(days=1)).date()
     first_day = last_day.replace(day=1)
     return first_day, last_day
@@ -44,14 +44,14 @@ def _month_bounds(exec_end: datetime) -> tuple[date, date]:
 
 @dag(
     dag_id=DAG_ID,
-    description="Coletar eventos OpenFDA de tirzepatida por 1 mês e salvar no BigQuery para série histórica",
+    description="Coletar eventos OpenFDA de semaglutida por 1 mês e salvar no BigQuery para série histórica",
     start_date=datetime(2025, 8, 1),
     schedule="@monthly",
     catchup=False,
     default_args={"owner": "data-eng"},
-    tags=["openfda", "tirzepatide", "bigquery"],
+    tags=["openfda", "semaglutide", "bigquery"],
 )
-def tirzepatide_openfda_monthly_to_bq():
+def semaglutide_openfda_monthly_to_bq():
     @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> List[Dict[str, Any]]:
         """
@@ -68,13 +68,13 @@ def tirzepatide_openfda_monthly_to_bq():
 
         endpoint = "https://api.fda.gov/drug/event.json"
 
-        # Filtro de produto mais abrangente
+        # Semaglutida (substance, generic e marcas principais)
         product_filter = (
             '('
-            'patient.drug.openfda.substance_name.exact:("TIRZEPATIDE") OR '
-            'patient.drug.openfda.generic_name.exact:("TIRZEPATIDE") OR '
-            'patient.drug.openfda.brand_name.exact:("MOUNJARO" OR "ZEPBOUND") OR '
-            'patient.drug.medicinalproduct:("tirzepatide" OR "Mounjaro" OR "Zepbound")'
+            'patient.drug.openfda.substance_name.exact:("SEMAGLUTIDE") OR '
+            'patient.drug.openfda.generic_name.exact:("SEMAGLUTIDE") OR '
+            'patient.drug.openfda.brand_name.exact:("OZEMPIC" OR "WEGOVY" OR "RYBELSUS") OR '
+            'patient.drug.medicinalproduct:("semaglutide" OR "Ozempic" OR "Wegovy" OR "Rybelsus")'
             ')'
         )
         rcv_range = f"receivedate:[{start_ds} TO {end_ds}]"
@@ -91,7 +91,6 @@ def tirzepatide_openfda_monthly_to_bq():
         params_count_rcpt = {"search": f"{product_filter} AND {rcp_range}", "count": "receiptdate", "limit": 1000}
         data2 = _openfda_get(endpoint, params_count_rcpt, timeout=60)
         if data2 and isinstance(data2.get("results"), list) and data2["results"]:
-            # Normaliza a chave para 'time' (OpenFDA devolve 'time' em ambos os counts)
             logging.info("OpenFDA count(receiptdate) => %d linhas.", len(data2["results"]))
             return data2["results"]
 
@@ -102,7 +101,6 @@ def tirzepatide_openfda_monthly_to_bq():
         total = 0
 
         while True:
-            # Evita 'fields' e 'sort' (podem causar 400 conforme variações do backend)
             params_page = {
                 "search": f"{product_filter} AND ({rcv_range} OR {rcp_range})",
                 "limit": limit,
@@ -114,7 +112,6 @@ def tirzepatide_openfda_monthly_to_bq():
                 break
 
             for ev in results:
-                # Preferimos receivedate; se não houver, usamos receiptdate
                 raw_date = ev.get("receivedate") or ev.get("receiptdate")
                 if not raw_date:
                     continue
@@ -169,7 +166,7 @@ def tirzepatide_openfda_monthly_to_bq():
 
         project_id = "bigquery-sandbox-471123"
         dataset_id = "dataset_fda"
-        table_id = "drug_events_tirzepatide_daily"
+        table_id = "drug_events_semaglutide_daily"  # nova tabela para semaglutida
         gcp_conn_id = "google_cloud_default"
 
         bq_hook = BigQueryHook(gcp_conn_id=gcp_conn_id, use_legacy_sql=False)
@@ -180,7 +177,7 @@ def tirzepatide_openfda_monthly_to_bq():
             client.get_dataset(dataset_ref)
         except Exception:
             ds = bigquery.Dataset(dataset_ref)
-            ds.location = "US"  # ajuste se seu projeto usar outra região
+            ds.location = "US"
             client.create_dataset(ds, exists_ok=True)
 
         table_ref = dataset_ref.table(table_id)
@@ -220,4 +217,4 @@ def tirzepatide_openfda_monthly_to_bq():
     save_to_bigquery(transformed)
 
 
-dag = tirzepatide_openfda_monthly_to_bq()
+dag = semaglutide_openfda_monthly_to_bq()
