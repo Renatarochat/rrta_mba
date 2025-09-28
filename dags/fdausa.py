@@ -41,7 +41,7 @@ def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Op
 def _month_bounds_from_year_month(y: int, m: int) -> Tuple[date, date]:
     """Primeiro e último dia do mês (ano, mês)."""
     first = date(y, m, 1)
-    # próximo mês: se dezembro, vira jan do próximo ano
+    # próximo mês
     if m == 12:
         next_first = date(y + 1, 1, 1)
     else:
@@ -58,14 +58,26 @@ def _resolve_window(ctx: Dict[str, Any]) -> Tuple[date, date]:
       2) dag_run.conf: {"start": "YYYYMMDD", "end": "YYYYMMDD"}  (inclusive)
       3) padrão do @monthly: mês de (data_interval_end - 1 dia)
     """
-    conf = (ctx.get("dag_run") or {}).get("conf") or {}
+    conf: Dict[str, Any] = {}
+    dag_run = ctx.get("dag_run")
+    # Airflow 3: dag_run.conf pode ser dict-like; converte de forma segura
+    try:
+        if dag_run is not None and getattr(dag_run, "conf", None):
+            if isinstance(dag_run.conf, dict):
+                conf = dag_run.conf
+            else:
+                try:
+                    conf = dict(dag_run.conf)  # Params/Mapping
+                except Exception:
+                    conf = {}
+    except Exception:
+        conf = {}
 
     # 1) year/month
     y = conf.get("year")
     m = conf.get("month")
     if isinstance(y, int) and isinstance(m, int) and 1 <= m <= 12:
-        first, last = _month_bounds_from_year_month(y, m)
-        return first, last
+        return _month_bounds_from_year_month(y, m)
 
     # 2) start/end (YYYYMMDD)
     start = conf.get("start")
@@ -97,7 +109,7 @@ def _ds(d: date) -> str:
     description="Coletar eventos OpenFDA de atorvastatina (Lipitor) por 1 mês e salvar no BigQuery para série histórica",
     start_date=datetime(2023, 1, 1),  # habilita backfill desde 2023
     schedule="@monthly",
-    catchup=True,  # para criar runs históricos automaticamente
+    catchup=True,  # permite executar meses de 2023
     default_args={"owner": "data-eng"},
     tags=["openfda", "atorvastatin", "lipitor", "bigquery"],
 )
@@ -142,12 +154,11 @@ def atorvastatin_openfda_monthly_to_bq():
             logging.info("count(receiptdate) → %d linhas.", len(data_b["results"]))
             return data_b["results"]
 
-        # (C) PROBE sem filtro de produto (apenas data) para receivedate
+        # (C) PROBE sem filtro de produto (apenas data) para receivedate e/ou receiptdate
         probe = _openfda_get(OPENFDA_ENDPOINT, {"search": rcv_range, "count": "receivedate"}, timeout=45)
         probe_n = len((probe or {}).get("results", []) or [])
         logging.info("[PROBE receivedate] %d pontos.", probe_n)
 
-        # Se probe vazio, tenta probe por receiptdate (alguns meses só têm esse campo)
         if probe_n == 0:
             probe2 = _openfda_get(OPENFDA_ENDPOINT, {"search": rcp_range, "count": "receiptdate"}, timeout=45)
             probe_n2 = len((probe2 or {}).get("results", []) or [])
