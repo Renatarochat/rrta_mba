@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
-from collections import Counter
 
 import requests
 from airflow.decorators import dag, task
@@ -17,16 +17,28 @@ DAG_ID = "openfda_tirzepatide_monthly_to_bq"
 
 
 def _openfda_get(endpoint: str, params: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
-    """Wrapper para GET da OpenFDA: trata 404 como vazio e valida JSON."""
+    """GET com pequenas tolerâncias: 404 -> None; 429/5xx com retry simples."""
     headers = {"User-Agent": f"airflow-dag/{DAG_ID}"}
-    resp = requests.get(endpoint, params=params, headers=headers, timeout=timeout)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    try:
-        return resp.json()
-    except Exception:
-        return None
+    for attempt in range(3):
+        resp = requests.get(endpoint, params=params, headers=headers, timeout=timeout)
+        if resp.status_code == 404:
+            return None
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except Exception:
+            return None
+    return None
+
+
+def _month_bounds(exec_end: datetime) -> tuple[date, date]:
+    """Retorna (primeiro_dia, ultimo_dia) do mês referente ao data_interval_end - 1 dia."""
+    last_day = (exec_end - timedelta(days=1)).date()
+    first_day = last_day.replace(day=1)
+    return first_day, last_day
 
 
 @dag(
@@ -42,83 +54,57 @@ def tirzepatide_openfda_monthly_to_bq():
     @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> List[Dict[str, Any]]:
         """
-        Busca agregada diária (count=receivedate). Se vier vazio, faz fallback
-        paginando eventos e agregando localmente (considera receivedate/receiptdate).
+        Tenta a agregação nativa (count=receivedate).
+        Se vier vazia/404, faz fallback por dia (até 31 chamadas) somando counts.
         """
         ctx = get_current_context()
-        data_interval_end: datetime = ctx["data_interval_end"]
-
-        # Janela mensal (primeiro ao último dia do mês da execução)
-        last_day = (data_interval_end - timedelta(days=1)).date()
-        first_day = last_day.replace(day=1)
+        first_day, last_day = _month_bounds(ctx["data_interval_end"])
 
         start_ds = first_day.strftime("%Y%m%d")
         end_ds = last_day.strftime("%Y%m%d")
 
-        if start_ds > end_ds:
-            logging.info("Intervalo invertido %s > %s; retornando vazio.", start_ds, end_ds)
-            return []
-
         endpoint = "https://api.fda.gov/drug/event.json"
 
-        # Filtro robusto: combina medicinalproduct, brand_name e substance_name
+        # Filtro por produto (robusto, mas simples o suficiente para evitar 400s).
         product_filter = (
             '('
-            'patient.drug.medicinalproduct:("tirzepatide" OR "Mounjaro" OR "Zepbound") OR '
-            'patient.drug.medicinalproduct.exact:("TIRZEPATIDE" OR "MOUNJARO" OR "ZEPBOUND") OR '
-            'patient.drug.openfda.brand_name.exact:("MOUNJARO" OR "ZEPBOUND") OR '
-            'patient.drug.openfda.substance_name.exact:("TIRZEPATIDE")'
+            'patient.drug.medicinalproduct:("tirzepatide" OR "Mounjaro" OR "Zepbound") '
+            'OR patient.drug.openfda.substance_name.exact:("TIRZEPATIDE") '
+            'OR patient.drug.openfda.brand_name.exact:("MOUNJARO" OR "ZEPBOUND")'
             ')'
         )
-        date_filter = f"receivedate:[{start_ds} TO {end_ds}]"
-        base_search = f"{product_filter} AND {date_filter}"
+        date_range = f"receivedate:[{start_ds} TO {end_ds}]"
+        base_search = f"{product_filter} AND {date_range}"
 
-        # 1) Tentativa com agregação nativa
+        # 1) Agregação nativa
         params_count = {"search": base_search, "count": "receivedate", "limit": 1000}
         data = _openfda_get(endpoint, params_count, timeout=60)
         if data and isinstance(data.get("results"), list) and data["results"]:
-            logging.info("OpenFDA (count=receivedate) retornou %d pontos.", len(data["results"]))
+            logging.info("OpenFDA count retornou %d linhas.", len(data["results"]))
             return data["results"]
 
-        # 2) Fallback: paginação de eventos e agregação local por receivedate/receiptdate
-        rows_per_page = 100
-        skip = 0
-        counts = Counter()
+        # 2) Fallback: por dia (count por dia específico)
+        out: List[Dict[str, Any]] = []
+        cur = first_day
+        while cur <= last_day:
+            d = cur.strftime("%Y%m%d")
+            search = f"{product_filter} AND receivedate:{d}"
+            params_daily = {"search": search, "count": "receivedate", "limit": 1}
+            daily = _openfda_get(endpoint, params_daily, timeout=30)
+            results = (daily or {}).get("results", [])
+            if isinstance(results, list) and results:
+                # A API retorna [{"time":"YYYYMMDD", "count": N}]
+                item = results[0]
+                # Garante que a data é exatamente o dia consultado
+                if str(item.get("time")) == d and int(item.get("count", 0)) > 0:
+                    out.append({"time": d, "count": int(item["count"])})
+            cur += timedelta(days=1)
 
-        while True:
-            params_page = {
-                "search": base_search + " AND (_exists_:receivedate OR _exists_:receiptdate)",
-                "limit": rows_per_page,
-                "skip": skip,
-                "sort": "receivedate:asc",
-                "fields": "receivedate,receiptdate",
-            }
-            page = _openfda_get(endpoint, params_page, timeout=60)
-            results = (page or {}).get("results", [])
-            if not results:
-                break
-
-            for r in results:
-                rd = r.get("receivedate") or r.get("receiptdate")
-                if rd:
-                    counts[str(rd)] += 1
-
-            if len(results) < rows_per_page:
-                break
-            skip += rows_per_page
-
-        out = [{"time": k, "count": v} for k, v in sorted(counts.items())]
-        logging.info("Fallback agregou %d dias.", len(out))
+        logging.info("Fallback diário produziu %d linhas.", len(out))
         return out
 
     @task(task_id="transform_events")
     def transform_events(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Normaliza:
-        - 'time' -> 'receivedate'
-        - receivedate -> YYYY-MM-DD
-        - count -> INT
-        """
         out: List[Dict[str, Any]] = []
         for row in results or []:
             received = row.get("receivedate", row.get("time"))
@@ -142,7 +128,7 @@ def tirzepatide_openfda_monthly_to_bq():
 
             out.append({"receivedate": dt.isoformat(), "count": c})
 
-        logging.info("Transform produziu %d linhas.", len(out))
+        logging.info("Transform gerou %d linhas.", len(out))
         return out
 
     @task(task_id="save_to_bigquery")
@@ -160,7 +146,6 @@ def tirzepatide_openfda_monthly_to_bq():
         client: bigquery.Client = bq_hook.get_client(project_id=project_id)
 
         dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
-
         try:
             client.get_dataset(dataset_ref)
         except Exception:
@@ -169,14 +154,11 @@ def tirzepatide_openfda_monthly_to_bq():
             client.create_dataset(ds, exists_ok=True)
 
         table_ref = dataset_ref.table(table_id)
-
         schema = [
             bigquery.SchemaField("receivedate", "DATE", mode="REQUIRED"),
             bigquery.SchemaField("count", "INT64", mode="REQUIRED"),
         ]
-        time_partitioning = bigquery.TimePartitioning(
-            type_=bigquery.TimePartitioningType.DAY, field="receivedate"
-        )
+        time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="receivedate")
 
         try:
             client.get_table(table_ref)
