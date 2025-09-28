@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,24 +19,6 @@ OPENFDA_ENDPOINT = "https://api.fda.gov/drug/event.json"
 
 
 # --------------------------- Helpers ---------------------------
-
-def _openfda_get(params: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
-    """GET tolerante: 404 -> None; 429/5xx -> retries leves; demais -> raise."""
-    headers = {"User-Agent": f"airflow-dag/{DAG_ID}"}
-    for attempt in range(3):
-        resp = requests.get(OPENFDA_ENDPOINT, params=params, headers=headers, timeout=timeout)
-        if resp.status_code == 404:
-            return None
-        if resp.status_code in (429, 500, 502, 503, 504):
-            time.sleep(2 * (attempt + 1))
-            continue
-        resp.raise_for_status()
-        try:
-            return resp.json()
-        except Exception:
-            return None
-    return None
-
 
 def _month_bounds(ctx: Dict[str, Any]) -> Tuple[date, date]:
     """
@@ -71,11 +54,29 @@ def _ds(d: date) -> str:
     return d.strftime("%Y%m%d")
 
 
+def _openfda_get(params: Dict[str, Any], timeout: int = 60) -> Optional[Dict[str, Any]]:
+    """GET tolerante: 404 -> None; 429/5xx -> retries leves; demais -> raise."""
+    headers = {"User-Agent": f"airflow-dag/{DAG_ID}"}
+    for attempt in range(3):
+        resp = requests.get(OPENFDA_ENDPOINT, params=params, headers=headers, timeout=timeout)
+        if resp.status_code == 404:
+            return None
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except Exception:
+            return None
+    return None
+
+
 # --------------------------- DAG ---------------------------
 
 @dag(
     dag_id=DAG_ID,
-    description="Coletar eventos OpenFDA (Atorvastatin/Lipitor) por mês e salvar no BigQuery para série histórica",
+    description="Coletar eventos OpenFDA (Atorvastatin/Lipitor) por mês e salvar contagem diária no BigQuery",
     start_date=datetime(2023, 1, 1),
     schedule="@monthly",
     catchup=True,
@@ -86,15 +87,16 @@ def atorvastatin_openfda_monthly_to_bq():
     @task(task_id="fetch_openfda", retries=2, retry_delay=timedelta(minutes=5))
     def fetch_openfda() -> List[Dict[str, Any]]:
         """
-        Busca contagem diária priorizando 'receiptdate' (data de recebimento no FDA).
-        Se vier vazio, tenta 'receivedate'. Normaliza saída para {'receivedate': 'YYYY-MM-DD', 'count': N}.
+        Busca eventos crus (apenas campos receiptdate/receivedate) com paginação e
+        retorna lista de dicionários desses campos para o mês.
+        Faz OR entre receiptdate e receivedate para cobrir ambas as datas.
         """
         ctx = get_current_context()
         first_day, last_day = _month_bounds(ctx)
         start_ds, end_ds = _ds(first_day), _ds(last_day)
         logging.info("Janela consultada: %s..%s", start_ds, end_ds)
 
-        # Filtro amplo (não usa .exact para ganhar recall; case-insensitive)
+        # Filtro amplo para aumentar recall (sem .exact / case-insensitive)
         product_filter = (
             '('
             'patient.drug.medicinalproduct:(atorvastatin OR "ATORVASTATIN" OR lipitor) OR '
@@ -104,61 +106,76 @@ def atorvastatin_openfda_monthly_to_bq():
             'patient.drug.openfda.brand_name:(LIPITOR)'
             ')'
         )
+        window_filter = f"(receiptdate:[{start_ds} TO {end_ds}] OR receivedate:[{start_ds} TO {end_ds}])"
+        search = f"{product_filter} AND {window_filter}"
 
-        # 1) Agrega por receiptdate
-        params_recpt = {
-            "search": f"{product_filter} AND receiptdate:[{start_ds} TO {end_ds}]",
-            "count": "receiptdate",
-            "limit": 1000,
-        }
-        data = _openfda_get(params_recpt, timeout=60)
-        results = (data or {}).get("results", []) if isinstance(data, dict) else []
+        rows: List[Dict[str, Any]] = []
+        limit = 100
+        skip = 0
+        # pagina até esgotar (o volume para um único fármaco por mês é normalmente baixo)
+        while True:
+            page = _openfda_get(
+                {
+                    "search": search,
+                    "limit": limit,
+                    "skip": skip,
+                    "fields": "receiptdate,receivedate",
+                    "sort": "receiptdate:asc",
+                },
+                timeout=60,
+            )
+            batch = (page or {}).get("results", [])
+            if not batch:
+                break
+            for ev in batch:
+                # mantemos só os campos de interesse
+                rcv = ev.get("receiptdate")
+                rcvd = ev.get("receivedate")
+                if rcv or rcvd:
+                    rows.append({"receiptdate": rcv, "receivedate": rcvd})
+            if len(batch) < limit:
+                break
+            skip += limit
 
-        # 2) Se vazio, tenta por receivedate
-        if not results:
-            params_recv = {
-                "search": f"{product_filter} AND receivedate:[{start_ds} TO {end_ds}]",
-                "count": "receivedate",
-                "limit": 1000,
-            }
-            data2 = _openfda_get(params_recv, timeout=60)
-            results = (data2 or {}).get("results", []) if isinstance(data2, dict) else []
+        logging.info("Eventos brutos coletados: %d", len(rows))
+        return rows
 
-        # Normaliza para lista de dicts com 'receivedate' (nome canônico na nossa tabela)
-        out: List[Dict[str, Any]] = []
-        for row in results or []:
-            t = row.get("time") or row.get("receivedate") or row.get("receiptdate")
-            c = row.get("count")
-            if t is None or c is None:
+    @task(task_id="transform_events")
+    def transform_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Agrega por dia (preferindo 'receiptdate'; se ausente, usa 'receivedate').
+        Saída: [{"receivedate":"YYYY-MM-DD","count":N}, ...]
+        """
+        counter: Counter[str] = Counter()
+        for ev in events or []:
+            s = str(ev.get("receiptdate") or ev.get("receivedate") or "")
+            if not s:
                 continue
-            s = str(t)
             try:
                 if len(s) == 8 and s.isdigit():
                     dt = datetime.strptime(s, "%Y%m%d").date()
                 else:
                     dt = datetime.fromisoformat(s).date()
-                cnt = int(c)
             except Exception:
                 continue
-            out.append({"receivedate": dt.isoformat(), "count": cnt})
+            counter[dt.isoformat()] += 1
 
-        logging.info("Registros normalizados: %d", len(out))
+        out = [{"receivedate": d, "count": int(n)} for d, n in sorted(counter.items())]
+        logging.info("Dias agregados: %d", len(out))
         return out
 
     @task(task_id="save_to_bigquery")
     def save_to_bigquery(rows: List[Dict[str, Any]]) -> None:
         """
         Grava no BigQuery (dataset_fda.drug_events_atorvastatin_daily), particionado por dia.
-        Mantém o nome da coluna 'receivedate' (mesmo quando a origem for 'receiptdate').
         """
         project_id = "bigquery-sandbox-471123"
         dataset_id = "dataset_fda"
         table_id = "drug_events_atorvastatin_daily"
         gcp_conn_id = "google_cloud_default"
 
-        # Se vier vazio, apenas loga (não falha o DAG)
         if not rows:
-            logging.info("Nenhum dado retornado pela OpenFDA para a janela. Nada a carregar.")
+            logging.info("Nenhum dado agregado para carregar. Nada a fazer.")
             return
 
         bq_hook = BigQueryHook(gcp_conn_id=gcp_conn_id, use_legacy_sql=False)
@@ -173,7 +190,6 @@ def atorvastatin_openfda_monthly_to_bq():
             client.create_dataset(ds, exists_ok=True)
 
         table_ref = ds_ref.table(table_id)
-
         schema = [
             bigquery.SchemaField("receivedate", "DATE", mode="REQUIRED"),
             bigquery.SchemaField("count", "INT64", mode="REQUIRED"),
@@ -187,7 +203,6 @@ def atorvastatin_openfda_monthly_to_bq():
             tbl.time_partitioning = time_part
             client.create_table(tbl)
 
-        # Carrega JSON Lines em memória
         from io import BytesIO
         import json
 
@@ -208,9 +223,9 @@ def atorvastatin_openfda_monthly_to_bq():
         job.result()
         logging.info("BigQuery: carregadas %d linhas em %s.%s.%s", len(rows), project_id, dataset_id, table_id)
 
-    # flow
-    series = fetch_openfda()
-    save_to_bigquery(series)
+    fetched = fetch_openfda()
+    transformed = transform_events(fetched)
+    save_to_bigquery(transformed)
 
 
 dag = atorvastatin_openfda_monthly_to_bq()
