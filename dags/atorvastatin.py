@@ -20,8 +20,8 @@ BQ_TABLE_COUNT  = "atorvastatin_ae_daily"
 BQ_LOCATION     = "US"                       # região do dataset
 GCP_CONN_ID     = "google_cloud_default"     # conexão no Astronomer
 
-# Jan -> Dez/2022 (inclusive)
-TEST_START = date(2022, 1, 1)
+# Jun -> Dez/2022 (inclusive)
+TEST_START = date(2022, 6, 1)
 TEST_END   = date(2022, 12, 31)
 
 DRUG_GENERIC = "atorvastatin"  # filtro do medicamento
@@ -134,7 +134,7 @@ def openfda_atorvastatin_ae_pipeline():
                 time.sleep(0.25)  # respeita rate limit
             print(f"[fetch] {day}: {total_dia} registros.")
             day = date.fromordinal(day.toordinal() + 1)
-        print(f"[fetch] Jan–Dez/2022: {n_calls} chamadas, {len(all_rows)} registros no total.")
+        print(f"[fetch] Jun–Dez/2022: {n_calls} chamadas, {len(all_rows)} registros no total.")
 
         # Normaliza
         df = _to_flat_drug(all_rows)
@@ -235,7 +235,7 @@ def openfda_atorvastatin_ae_pipeline():
 
         table_id_counts = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}"
 
-        # **PONTO CRÍTICO**: remover a tabela antes para descartar partições antigas com campo diferente
+        #Remover a tabela antes para descartar partições antigas com campo diferente
         client.delete_table(table_id_counts, not_found_ok=True)
 
         job_config_counts = bigquery.LoadJobConfig(
