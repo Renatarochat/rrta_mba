@@ -15,8 +15,8 @@ from typing import Any, Dict, List
 # Config
 GCP_PROJECT     = "bigquery-sandbox-471123"          
 BQ_DATASET      = "dataset_fda"                  
-BQ_TABLE_STAGE  = "atorvastatin_ae_stage"
-BQ_TABLE_COUNT  = "atorvastatin_ae_daily"
+BQ_TABLE_STAGE  = "colesterol_stage"
+BQ_TABLE_COUNT  = "colesterol_daily"
 BQ_LOCATION     = "US"                       
 GCP_CONN_ID     = "google_cloud_default"     
 
