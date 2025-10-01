@@ -64,10 +64,14 @@ def _to_flat_drug(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         patient = ev.get("patient", {})
         drugs = patient.get("drug", [])
         drug0 = drugs[0] if drugs else {}
+        # Coletar todas as reações adversas (reactionmeddrapt)
+        reactions = "; ".join([
+            r.get("reactionmeddrapt") for r in ev.get("reaction", []) if r.get("reactionmeddrapt")
+        ])
         flat.append({
             "safetyreportid": ev.get("safetyreportid"),
             "receivedate": ev.get("receivedate"),
-            "reaction": (ev.get("reaction", [{}])[0] or {}).get("reactionmeddrapt"),
+            "reaction": reactions,
             "drugname": drug0.get("medicinalproduct"),
             "drugindication": drug0.get("drugindication"),
             "patientsex": patient.get("patientsex"),
@@ -134,7 +138,7 @@ def openfda_atorvastatin_ae_pipeline():
                 time.sleep(0.25)  # respeita rate limit
             print(f"[fetch] {day}: {total_dia} registros.")
             day = date.fromordinal(day.toordinal() + 1)
-        print(f"[fetch] Jun–jul/2022: {n_calls} chamadas, {len(all_rows)} registros no total.")
+        print(f"[fetch] Jun–Jul/2022: {n_calls} chamadas, {len(all_rows)} registros no total.")
 
         # Normaliza
         df = _to_flat_drug(all_rows)
@@ -235,7 +239,7 @@ def openfda_atorvastatin_ae_pipeline():
 
         table_id_counts = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}"
 
-        #Remover a tabela antes para descartar partições antigas com campo diferente
+        # Remover a tabela antes para descartar partições antigas com campo diferente
         client.delete_table(table_id_counts, not_found_ok=True)
 
         job_config_counts = bigquery.LoadJobConfig(
