@@ -22,7 +22,7 @@ GCP_CONN_ID     = "google_cloud_default"
 
 # Jun -> Jul/2024 (inclusive)
 TEST_START = date(2024, 6, 1)
-TEST_END   = date(2024, 7, 31)
+TEST_END   = date(2024, 6, 30)
 
 DRUGS_GENERIC = ["atorvastatin", "sinvastatin", "rosuvastatin", "pitavastatin"]  # filtros dos medicamentos
 
