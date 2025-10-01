@@ -20,9 +20,9 @@ BQ_TABLE_COUNT  = "atorvastatin_ae_daily"
 BQ_LOCATION     = "US"                       # região do dataset
 GCP_CONN_ID     = "google_cloud_default"     # conexão no Astronomer
 
-# Jun -> Jul/2022 (inclusive)
-TEST_START = date(2022, 6, 1)
-TEST_END   = date(2022, 7, 31)
+# Jun -> Jul/2024 (inclusive)
+TEST_START = date(2024, 6, 1)
+TEST_END   = date(2024, 7, 31)
 
 DRUG_GENERIC = "atorvastatin"  # filtro do medicamento
 
@@ -97,7 +97,7 @@ def _ensure_dataset(client: bigquery.Client, project: str, dataset: str, locatio
     dag_id="openfda_atorvastatin_ae_pipeline",
     description=(
         "openFDA drug/event (atorvastatin) → "
-        "normaliza (STAGE) → agrega diário (BQ). Jun–Jul/2022."
+        "normaliza (STAGE) → agrega diário (BQ). Jun–Jul/2024."
     ),
     # ...existing code...
 )
@@ -138,7 +138,7 @@ def openfda_atorvastatin_ae_pipeline():
                 time.sleep(0.25)  # respeita rate limit
             print(f"[fetch] {day}: {total_dia} registros.")
             day = date.fromordinal(day.toordinal() + 1)
-        print(f"[fetch] Jun–Jul/2022: {n_calls} chamadas, {len(all_rows)} registros no total.")
+        print(f"[fetch] Jun–Jul/2024: {n_calls} chamadas, {len(all_rows)} registros no total.")
 
         # Normaliza
         df = _to_flat_drug(all_rows)
